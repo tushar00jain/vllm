@@ -60,7 +60,10 @@ def _set_vllm_config(
             tensor_model_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
             pipeline_model_parallel_size=vllm_config.parallel_config.pipeline_parallel_size,
         )
-        cpu_group = torch.distributed.new_group(list(range(world_size)), backend="gloo")
+        cpu_group = torch.distributed.split_group(
+            split_ranks=[list(range(world_size))],
+            group_desc="moe_test_cpu",
+        )
     return cpu_group
 
 
