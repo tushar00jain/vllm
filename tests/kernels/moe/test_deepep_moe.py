@@ -374,7 +374,10 @@ def _deep_ep_moe(
         w1_scale = w1_scale.to(device=device_idx)
         w2_scale = w2_scale.to(device=device_idx)
 
-    pg = torch.distributed.new_group(list(range(pgi.world_size)))
+    pg = torch.distributed.split_group(
+        split_ranks=[list(range(pgi.world_size))],
+        group_desc="deepep_test",
+    )
     test_tensors = TestTensors.make(config, low_latency_mode)
 
     with set_current_vllm_config(VllmConfig()):
