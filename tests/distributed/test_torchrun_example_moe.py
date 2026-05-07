@@ -5,13 +5,19 @@
 import os
 import random
 
+import torch
 import torch.distributed as dist
 
 from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import get_tp_group, get_world_group
 
-# Let PyTorch choose the WORLD backend for the current device type.
-dist.init_process_group()
+# Initialize the default PG with both CPU (gloo) and device (nccl) backends eagerly
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+dist.init_process_group(
+    backend="cpu:gloo,cuda:nccl",
+    device_id=torch.device(f"cuda:{local_rank}"),
+)
 
 # Create prompts
 prompts = [
