@@ -378,7 +378,10 @@ def _test_deepep_deepgemm_moe(
     w1_scale = w1_scale.to(device=device)
     w2_scale = w2_scale.to(device=device)
 
-    pg = torch.distributed.new_group(list(range(pgi.world_size)))
+    pg = torch.distributed.split_group(
+        split_ranks=[list(range(pgi.world_size))],
+        group_desc="deepep_deepgemm_test",
+    )
     test_tensors = TestTensors.make(config, pgi.rank)
     block_shape = [w1.size(1) // w1_scale.size(1), w1.size(2) // w1_scale.size(2)]
 

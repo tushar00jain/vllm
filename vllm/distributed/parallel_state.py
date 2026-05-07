@@ -336,19 +336,17 @@ class GroupCoordinator:
         self_cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
+                group = torch.distributed.split_group(
+                    split_ranks=[ranks],
+                    group_desc=group_name,
+                )
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
+                self_device_group = group
+                self_cpu_group = group
+                break
 
         assert self_cpu_group is not None
         assert self_device_group is not None
@@ -1428,13 +1426,33 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
-        # this backend is used for WORLD
+        # set the local rank
+        # local_rank is not available in torch ProcessGroup,
+        # see https://github.com/pytorch/pytorch/issues/122816
+        if local_rank == -1:
+            # local rank not set, this usually happens in single-node
+            # setting, where we can use rank as local rank
+            local_rank = (
+                envs.LOCAL_RANK if distributed_init_method == "env://" else rank
+            )
+
+        # Use mixed backend so the default PG has both CPU (gloo) and
+        # CUDA (nccl) backends. Pass device_id to eagerly initialize
+        # the NCCL communicator, enabling split_group for subgroups.
+        # On CPU-only systems, fall back to gloo.
+        if torch.accelerator.is_available() and backend != "gloo":
+            init_backend = "cpu:gloo,cuda:nccl"
+            device_id = torch.device(f"cuda:{local_rank}")
+        else:
+            init_backend = "gloo"
+            device_id = None
         torch.distributed.init_process_group(
-            backend=backend,
+            backend=init_backend,
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
             timeout=timeout,
+            device_id=device_id,
         )
         if enable_elastic_ep:
             tp_pp_cpu_group = torch.distributed.new_group(
@@ -1447,14 +1465,6 @@ def init_distributed_environment(
                 raise RuntimeError(
                     "Elastic EP is not yet supported with multi-node TP/PP"
                 )
-
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
-    if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
-        local_rank = envs.LOCAL_RANK if distributed_init_method == "env://" else rank
 
     global _WORLD, _NODE_COUNT, _INNER_DP_WORLD
     if enable_elastic_ep:
