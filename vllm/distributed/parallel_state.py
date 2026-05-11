@@ -385,8 +385,6 @@ class GroupCoordinator:
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
 
-        from vllm.platforms import current_platform
-
         if current_platform.is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         elif current_platform.is_xpu():
