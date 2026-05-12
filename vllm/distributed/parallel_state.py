@@ -335,28 +335,75 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+        from vllm.platforms import current_platform
+
+        # VLLM_USE_SPLIT_GROUP gates the new ``split_group`` codepath added
+        # in this PR. Default ("0") preserves the legacy ``new_group`` path.
+        if envs.VLLM_USE_SPLIT_GROUP:
+            if current_platform.is_cuda_alike():
+                device_type = "cuda"
+            elif current_platform.is_xpu():
+                device_type = "xpu"
+            elif current_platform.is_out_of_tree():
+                device_type = current_platform.device_name
+            else:
+                device_type = "cpu"
+
+            # ``torch_distributed_backend`` may arrive as a bare backend name
+            # (e.g. "nccl") or already prefixed with the device type
+            # (e.g. "cuda:nccl"). split_group's ``backend`` arg uses the
+            # init_process_group format, which requires the prefix.
+            device_backend_str = (
+                str(torch_distributed_backend)
+                if ":" in str(torch_distributed_backend)
+                else f"{device_type}:{torch_distributed_backend}"
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
+
+            for ranks in group_ranks:
+                if self.rank in ranks:
+                    self_device_group = torch.distributed.split_group(
+                        split_ranks=[ranks],
+                        group_desc=f"{group_name}:device",
+                        backend=device_backend_str,
+                    )
+                    # CPU subgroup: split_group requires the requested
+                    # backend filter to include the parent's default device
+                    # type (= ``torch.accelerator.current_accelerator()``,
+                    # e.g. cuda), so a cpu-only filter is rejected. Include
+                    # the device backend in the filter to satisfy that
+                    # constraint; the group is still used for CPU
+                    # collectives on its gloo backend.
+                    self_cpu_group = torch.distributed.split_group(
+                        split_ranks=[ranks],
+                        group_desc=f"{group_name}:cpu",
+                        backend=f"cpu:gloo,{device_backend_str}",
+                    )
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    break
+        else:
+            # Legacy ``new_group`` codepath.
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                with suppress_stdout():
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group
 
         assert self_cpu_group is not None
         assert self_device_group is not None
 
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
-
-        from vllm.platforms import current_platform
 
         if current_platform.is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
@@ -1428,14 +1475,44 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
-        # this backend is used for WORLD
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank,
-            timeout=timeout,
-        )
+        # set the local rank
+        # local_rank is not available in torch ProcessGroup,
+        # see https://github.com/pytorch/pytorch/issues/122816
+        if local_rank == -1:
+            # local rank not set, this usually happens in single-node
+            # setting, where we can use rank as local rank
+            local_rank = (
+                envs.LOCAL_RANK if distributed_init_method == "env://" else rank
+            )
+
+        if envs.VLLM_USE_SPLIT_GROUP:
+            # Use mixed backend so the default PG has both CPU (gloo) and
+            # CUDA (nccl) backends. Pass device_id to eagerly initialize
+            # the NCCL communicator, enabling split_group for subgroups.
+            # On CPU-only systems, fall back to gloo.
+            if torch.accelerator.is_available() and backend != "gloo":
+                init_backend = "cpu:gloo,cuda:nccl"
+                device_id = torch.device(f"cuda:{local_rank}")
+            else:
+                init_backend = "gloo"
+                device_id = None
+            torch.distributed.init_process_group(
+                backend=init_backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+                device_id=device_id,
+            )
+        else:
+            # Legacy path: single backend, no device_id (lazy init).
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+            )
         if enable_elastic_ep:
             tp_pp_cpu_group = torch.distributed.new_group(
                 backend="gloo", timeout=timeout
@@ -1448,9 +1525,32 @@ def init_distributed_environment(
                     "Elastic EP is not yet supported with multi-node TP/PP"
                 )
 
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
+    if (
+        envs.VLLM_USE_SPLIT_GROUP
+        and torch.accelerator.is_available()
+    ):
+        # When an external launcher (e.g. torchrun) initialized the default
+        # PG, require both ``device_id`` and a CPU backend. ``GroupCoordinator``
+        # builds two ``split_group`` subgroups (device-only and CPU+device),
+        # so the parent must already have both backends — ``split_group`` only
+        # selects subsets, it doesn't add new backends.
+        default_pg = torch.distributed.distributed_c10d._get_default_group()
+        assert default_pg.bound_device_id is not None, (
+            "External launcher initialized the default process group "
+            "without device_id. vLLM requires the default PG to be device-"
+            "bound for split_group. Pass device_id=torch.device(f'cuda:"
+            "{local_rank}') to torch.distributed.init_process_group()."
+        )
+        try:
+            default_pg._get_backend(torch.device("cpu"))
+        except RuntimeError as e:
+            raise RuntimeError(
+                "External launcher initialized the default process group "
+                "without a CPU (gloo) backend. vLLM requires both CPU and "
+                "device backends. Pass backend='cpu:gloo,cuda:nccl' to "
+                "torch.distributed.init_process_group()."
+            ) from e
+
     if local_rank == -1:
         # local rank not set, this usually happens in single-node
         # setting, where we can use rank as local rank
