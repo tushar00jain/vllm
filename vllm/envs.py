@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
-    VLLM_USE_SPLIT_GROUP: bool = False
+    VLLM_USE_SPLIT_GROUP: bool = True
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
