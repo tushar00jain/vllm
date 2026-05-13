@@ -1069,6 +1069,25 @@ def init_worker_distributed_environment(
 
     init_method = distributed_init_method or "env://"
 
+    # When torchcomms is enabled,
+    # torchcomms.new_comm() reads TORCHCOMM_RANK and TORCHCOMM_SIZE from
+    # the environment. These are normally set by torchrun, but vLLM's
+    # multiproc executor passes rank/world_size as function arguments
+    # instead. Propagate them here so torchcomms can find them.
+    # Also set MASTER_ADDR/MASTER_PORT since torchcomms' store manager
+    # requires them for gloo group creation.
+    if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1":
+        os.environ["TORCHCOMM_RANK"] = str(rank)
+        os.environ["TORCHCOMM_SIZE"] = str(parallel_config.world_size)
+        if "MASTER_ADDR" not in os.environ and distributed_init_method:
+            # Extract host:port from tcp://host:port
+            from urllib.parse import urlparse
+            parsed = urlparse(init_method)
+            if parsed.hostname:
+                os.environ["MASTER_ADDR"] = parsed.hostname
+            if parsed.port:
+                os.environ["MASTER_PORT"] = str(parsed.port)
+
     timeout = None
     if parallel_config.distributed_timeout_seconds is not None:
         timeout = timedelta(seconds=parallel_config.distributed_timeout_seconds)

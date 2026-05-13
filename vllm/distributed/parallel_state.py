@@ -287,6 +287,14 @@ direct_register_custom_op(
 )
 
 
+try:
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -1110,11 +1118,16 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        # torchcomms wraps sub-groups; destroying them can deadlock or
+        # raise "Invalid process group" errors.
+        if not _use_torchcomms_enabled():
+            if hasattr(self, "device_group"):
+                torch.distributed.destroy_process_group(self.device_group)
+            if hasattr(self, "cpu_group"):
+                torch.distributed.destroy_process_group(self.cpu_group)
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
         if self.device_communicator is not None:
             self.device_communicator.destroy()
@@ -1492,7 +1505,14 @@ def init_distributed_environment(
             # On CPU-only systems, fall back to gloo.
             if torch.accelerator.is_available() and backend != "gloo":
                 init_backend = "cpu:gloo,cuda:nccl"
-                device_id = torch.device(f"cuda:{local_rank}")
+                # Don't pass device_id when torchcomms is enabled — torchcomms
+                # wraps backends separately and the boundDeviceId check in
+                # _register_backend fails with mixed backends. Torchcomms
+                # doesn't need device_id for split_group to work.
+                if _use_torchcomms_enabled():
+                    device_id = None
+                else:
+                    device_id = torch.device(f"cuda:{local_rank}")
             else:
                 init_backend = "gloo"
                 device_id = None
@@ -2005,7 +2025,9 @@ def destroy_distributed_environment():
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized() and not _use_torchcomms_enabled():
+        # torchcomms wraps NCCL communicators; calling destroy_process_group
+        # triggers ncclCommDestroy which can deadlock during shutdown.
         torch.distributed.destroy_process_group()
 
 
@@ -2054,9 +2076,13 @@ def in_the_same_node_as(
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
-            "in_the_same_node_as should be tested with a non-NCCL group."
-        )
+        # When torchcomms is enabled, all groups (including gloo) are wrapped
+        # by torchcomms and may report as NCCL. Torchcomms handles CPU
+        # tensors transparently, so the check is safe to skip.
+        if not _use_torchcomms_enabled():
+            assert (
+                torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
+            ), "in_the_same_node_as should be tested with a non-NCCL group."
         # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
