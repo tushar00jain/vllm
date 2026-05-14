@@ -287,6 +287,14 @@ direct_register_custom_op(
 )
 
 
+try:
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -339,7 +347,9 @@ class GroupCoordinator:
 
         # VLLM_USE_SPLIT_GROUP gates the new ``split_group`` codepath added
         # in this PR. Default ("0") preserves the legacy ``new_group`` path.
-        if envs.VLLM_USE_SPLIT_GROUP:
+        # torchcomms requires split_group: ``new_group`` calls torchcomms'
+        # ``new_comm`` which hangs on the NCCL store key for sub-groups.
+        if envs.VLLM_USE_SPLIT_GROUP or _use_torchcomms_enabled():
             if current_platform.is_cuda_alike():
                 device_type = "cuda"
             elif current_platform.is_xpu():
@@ -1485,11 +1495,13 @@ def init_distributed_environment(
                 envs.LOCAL_RANK if distributed_init_method == "env://" else rank
             )
 
-        if envs.VLLM_USE_SPLIT_GROUP:
+        if envs.VLLM_USE_SPLIT_GROUP or _use_torchcomms_enabled():
             # Use mixed backend so the default PG has both CPU (gloo) and
             # CUDA (nccl) backends. Pass device_id to eagerly initialize
             # the NCCL communicator, enabling split_group for subgroups.
-            # On CPU-only systems, fall back to gloo.
+            # On CPU-only systems, fall back to gloo. torchcomms also
+            # requires the mixed-backend default PG so subgroup split_group
+            # calls have both backends to filter from.
             if torch.accelerator.is_available() and backend != "gloo":
                 init_backend = "cpu:gloo,cuda:nccl"
                 device_id = torch.device(f"cuda:{local_rank}")
@@ -1526,7 +1538,7 @@ def init_distributed_environment(
                 )
 
     if (
-        envs.VLLM_USE_SPLIT_GROUP
+        (envs.VLLM_USE_SPLIT_GROUP or _use_torchcomms_enabled())
         and torch.accelerator.is_available()
     ):
         # When an external launcher (e.g. torchrun) initialized the default
@@ -2005,7 +2017,9 @@ def destroy_distributed_environment():
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized() and not _use_torchcomms_enabled():
+        # torchcomms wraps NCCL communicators; calling destroy_process_group
+        # triggers ncclCommDestroy which can deadlock during shutdown.
         torch.distributed.destroy_process_group()
 
 
@@ -2054,9 +2068,13 @@ def in_the_same_node_as(
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
-            "in_the_same_node_as should be tested with a non-NCCL group."
-        )
+        # When torchcomms is enabled, all groups (including gloo) are wrapped
+        # by torchcomms and may report as NCCL. Torchcomms handles CPU
+        # tensors transparently, so the check is safe to skip.
+        if not _use_torchcomms_enabled():
+            assert (
+                torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
+            ), "in_the_same_node_as should be tested with a non-NCCL group."
         # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
