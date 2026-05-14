@@ -15,6 +15,13 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
 from vllm.platforms import current_platform
 
+try:
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
 from ..utils import (
     ensure_model_parallel_initialized,
     init_test_distributed_environment,
@@ -150,7 +157,7 @@ def qr_variable_input(rank, world_size):
     ranks = []
     for i in range(world_size):
         ranks.append(i)
-    if envs.VLLM_USE_SPLIT_GROUP:
+    if envs.VLLM_USE_SPLIT_GROUP or _use_torchcomms_enabled():
         dist.init_process_group(
             backend="cpu:gloo,cuda:nccl",
             init_method="tcp://127.0.0.1:29500",
@@ -165,7 +172,7 @@ def qr_variable_input(rank, world_size):
             rank=rank,
             world_size=world_size,
         )
-    if envs.VLLM_USE_SPLIT_GROUP:
+    if envs.VLLM_USE_SPLIT_GROUP or _use_torchcomms_enabled():
         cpu_group = torch.distributed.split_group(
             split_ranks=[ranks], backend="cpu:gloo,cuda:nccl"
         )

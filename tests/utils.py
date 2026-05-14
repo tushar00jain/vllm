@@ -1249,6 +1249,22 @@ def init_test_distributed_environment(
 
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
 
+    # Ray-spawned workers don't inherit RANK/WORLD_SIZE/MASTER_*, but
+    # torchcomms reads TORCHCOMM_RANK/SIZE from env and its store manager
+    # needs MASTER_ADDR/MASTER_PORT for gloo group creation.
+    try:
+        from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+    except (ImportError, AttributeError):
+
+        def _use_torchcomms_enabled() -> bool:
+            return False
+
+    if _use_torchcomms_enabled():
+        os.environ["TORCHCOMM_RANK"] = str(rank)
+        os.environ["TORCHCOMM_SIZE"] = str(pp_size * tp_size)
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", str(distributed_init_port))
+
     if get_current_vllm_config_or_none() is not None:
         # Config already set, use it directly
         init_distributed_environment(

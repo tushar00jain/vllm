@@ -570,9 +570,13 @@ def rearrange_expert_weights_inplace(
                 torch.empty_like(w) for w in first_layer_weights
             ]
             for weight, buffer in zip(expert_weights[0], weights_buffer):
-                dummy_recv_buffer = [buffer for _ in range(ep_size)]
+                dummy_recv_buffer = torch.empty(
+                    ep_size * weight.numel(),
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
                 torch.distributed.barrier()
-                all_gather(
+                torch.distributed.all_gather_into_tensor(
                     dummy_recv_buffer,
                     weight,
                     group=ep_group,

@@ -16,6 +16,7 @@ import torch
 from torch.distributed import (
     P2POp,
     ProcessGroup,
+    Work,
     batch_isend_irecv,
 )
 
@@ -29,6 +30,7 @@ from vllm.distributed.nixl_utils import (
 )
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
+    _use_torchcomms_enabled,
     get_pp_group,
     is_local_first_rank,
 )
@@ -38,6 +40,22 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+def _safe_batch_isend_irecv(p2p_ops: list[P2POp]) -> list[Work]:
+    """batch_isend_irecv that falls back to individual ops with torchcomms.
+
+    torchcomms' _BackendWrapper inherits supports_coalescing=True from the
+    C++ Backend base class but does not implement _start_coalescing() /
+    _end_coalescing(), which can cause hangs or crashes when
+    batch_isend_irecv takes the coalescing path.
+    """
+    if not _use_torchcomms_enabled():
+        return batch_isend_irecv(p2p_ops)
+
+    reqs: list[Work] = []
+    for op in p2p_ops:
+        work = op.op(op.tensor, op.peer, group=op.group, tag=op.tag)
+        reqs.append(work)
+    return reqs
 
 def has_nixl() -> bool:
     """Whether the optional NIXL / RIXL package is available."""
@@ -133,7 +151,7 @@ class TorchDistNcclEplbCommunicator(EplbCommunicator):
             return
         try:
             with torch.cuda.stream(self._cuda_stream):
-                reqs = batch_isend_irecv(self._p2p_ops)
+                reqs = _safe_batch_isend_irecv(self._p2p_ops)
                 for req in reqs:
                     req.wait()
         finally:
@@ -215,7 +233,7 @@ class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
         else:
             torch.cuda.current_stream().synchronize()
 
-        reqs = batch_isend_irecv(p2p_ops)
+        reqs = _safe_batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
 
