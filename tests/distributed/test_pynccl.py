@@ -22,6 +22,13 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.utils.system_utils import update_environment_variables
 
+try:
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
 mp.set_start_method("spawn", force=True)
 
 
@@ -82,9 +89,9 @@ def test_pynccl():
 
 def _split_or_new_group(split_ranks):
     """Use ``split_group`` when vLLM's eager-init path is active
-    (``VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1``)
+    (``VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1`` or torchcomms enabled)
     """
-    if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+    if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP or _use_torchcomms_enabled():
         return torch.distributed.split_group(
             split_ranks=split_ranks, backend="cpu:gloo,cuda:nccl"
         )
