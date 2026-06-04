@@ -248,8 +248,8 @@ def _device_backend_str(torch_distributed_backend: str | Backend) -> str:
     """Normalize ``torch_distributed_backend`` to the ``"<device>:<backend>"``
     format required by ``split_group``'s ``backend`` argument.
 
-    Accepts either a bare backend name (e.g. ``"nccl"``) or an already-prefixed
-    string (e.g. ``"cuda:nccl"``).
+    Accepts either a bare backend name (e.g. ``"nccl2"``) or an already-prefixed
+    string (e.g. ``"cuda:nccl2"``).
     """
     backend_str = str(torch_distributed_backend)
     if ":" in backend_str:
@@ -396,8 +396,10 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
-        # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the new ``split_group``
-        # codepath. Default (False) preserves the legacy ``new_group`` path.
+        # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the ``split_group`` codepath.
+        # Default (True) uses split_group over the eagerly-initialized,
+        # device_id-bound world PG; set it to 0 for the legacy ``new_group``
+        # path.
         if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
             self_device_group, self_cpu_group = _create_subgroups_split_group(
                 group_ranks, group_name, torch_distributed_backend
@@ -1431,13 +1433,13 @@ def _init_process_group_for_split_group(
     local_rank: int,
     timeout: timedelta | None,
 ) -> None:
-    """Initialize the default PG with both CPU (gloo) and device (e.g. nccl)
+    """Initialize the default PG with both CPU (gloo) and device (e.g. nccl2)
     backends and an eager ``device_id`` binding so that subgroups can be
     created via ``split_group`` (which requires the parent communicator to
     be eagerly initialized). Falls back to ``gloo`` on CPU-only systems.
     """
     if torch.accelerator.is_available() and backend != "gloo":
-        init_backend = "cpu:gloo,cuda:nccl"
+        init_backend = "cpu:gloo,cuda:nccl2"
         device_id: torch.device | None = torch.device(f"cuda:{local_rank}")
     else:
         init_backend = "gloo"
@@ -1455,7 +1457,7 @@ def _init_process_group_for_split_group(
 def _validate_default_pg_for_split_group() -> None:
     """When an external launcher (e.g. ``torchrun``) initialized the default
     PG, ``GroupCoordinator`` cannot patch in additional backends or change
-    the eager-init behavior — ``split_group`` only selects subsets of an
+    the eager-init behavior -- ``split_group`` only selects subsets of an
     existing parent. Validate that the parent has both ``device_id`` and a
     CPU (gloo) backend, and emit a descriptive error pointing at the exact
     init call to update otherwise.
@@ -1473,7 +1475,7 @@ def _validate_default_pg_for_split_group() -> None:
         raise RuntimeError(
             "External launcher initialized the default process group "
             "without a CPU (gloo) backend. vLLM requires both CPU and "
-            "device backends. Pass backend='cpu:gloo,cuda:nccl' to "
+            "device backends. Pass backend='cpu:gloo,cuda:nccl2' to "
             "torch.distributed.init_process_group()."
         ) from e
 
@@ -1518,7 +1520,7 @@ def init_distributed_environment(
     rank: int = -1,
     distributed_init_method: str = "env://",
     local_rank: int = -1,
-    backend: str = "nccl",
+    backend: str = "nccl2",
     timeout: timedelta | None = None,
 ):
     logger.debug(
