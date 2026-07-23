@@ -288,6 +288,47 @@ def _create_subgroups_split_group(
     return self_device_group, self_cpu_group
 
 
+def _create_subgroups_pp_lazy(
+    group_ranks: list[list[int]],
+    group_name: str,
+    rank: int,
+    local_rank: int,
+    torch_distributed_backend: str | Backend,
+) -> tuple[ProcessGroup | None, ProcessGroup]:
+    """Create the pipeline-parallel device + CPU subgroups.
+
+    The device subgroup uses the ``nccl-lazy`` backend so each pipeline-stage
+    peer gets a dedicated lazily-initialized P2P comm/stream, letting send/recv
+    to different stages overlap (unlike split_group's single shared comm). It is
+    created members-only (``use_local_synchronization=True``) over the
+    device_id-bound nccl2 parent, which does not implement the eager new_group
+    split path; every rank belongs to exactly one pipeline group, so it makes a
+    single members-only call.
+
+    The CPU subgroup is created via ``split_group`` (collective over the parent),
+    exactly like TP/DP in ``_create_subgroups_split_group``.
+    """
+    device_backend_str = _device_backend_str(torch_distributed_backend)
+    self_cpu_group = torch.distributed.split_group(
+        split_ranks=group_ranks,
+        group_desc=f"{group_name}:cpu",
+        backend=f"cpu:gloo,{device_backend_str}",
+    )
+    self_device_group = None
+    device_id = torch.device(f"cuda:{local_rank}")
+    for ranks in group_ranks:
+        if rank not in ranks:
+            continue
+        self_device_group = torch.distributed.new_group(
+            ranks,
+            backend="nccl-lazy",
+            use_local_synchronization=True,
+            device_id=device_id,
+        )
+        break
+    return self_device_group, self_cpu_group
+
+
 def patched_fused_scaled_matmul_reduce_scatter(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -401,9 +442,21 @@ class GroupCoordinator:
         # device_id-bound world PG; set it to 0 for the legacy ``new_group``
         # path.
         if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
-            self_device_group, self_cpu_group = _create_subgroups_split_group(
-                group_ranks, group_name, torch_distributed_backend
-            )
+            if group_name == "pp":
+                # The pipeline-parallel device group uses per-peer lazy P2P
+                # comms (nccl-lazy) so send/recv to different stages overlap;
+                # every other group, and every cpu group, stays on split_group.
+                self_device_group, self_cpu_group = _create_subgroups_pp_lazy(
+                    group_ranks,
+                    group_name,
+                    self.rank,
+                    local_rank,
+                    torch_distributed_backend,
+                )
+            else:
+                self_device_group, self_cpu_group = _create_subgroups_split_group(
+                    group_ranks, group_name, torch_distributed_backend
+                )
             for ranks in group_ranks:
                 if self.rank in ranks:
                     self.ranks = ranks
@@ -488,16 +541,24 @@ class GroupCoordinator:
     def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
         """Create a new device-side ProcessGroup with the same per-rank membership
         as this coordinator's `device_group`, but backed by a distinct communicator.
-        This is a collective call: every world rank must invoke it. Used where we
-        want to issue ops that can run concurrently with ops on `device_group`.
+        This is the pipeline-parallel sibling, so it uses the ``nccl-lazy`` backend
+        (per-peer lazy P2P comms). Every rank creates only its own group
+        members-only (``use_local_synchronization=True``): the nccl2 parent does
+        not implement the eager new_group split path. Used where we want to issue
+        ops that can run concurrently with ops on `device_group`.
         """
         sibling: ProcessGroup | None = None
+        device_id = torch.device(f"cuda:{self.local_rank}")
         for ranks in self.group_ranks:
-            pg = torch.distributed.new_group(
-                ranks, backend=self.torch_distributed_backend, group_desc=group_desc
+            if self.rank not in ranks:
+                continue
+            sibling = torch.distributed.new_group(
+                ranks,
+                backend="nccl-lazy",
+                group_desc=group_desc,
+                use_local_synchronization=True,
+                device_id=device_id,
             )
-            if self.rank in ranks:
-                sibling = pg
         assert sibling is not None
         return sibling
 
