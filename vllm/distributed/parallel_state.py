@@ -1690,6 +1690,16 @@ def init_distributed_environment(
 
     if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP and torch.accelerator.is_available():
         _validate_default_pg_for_split_group()
+        # The split-group parent PG is device-bound with the "nccl2" backend
+        # (hardcoded as "cuda:nccl2" in _init_process_group_for_split_group,
+        # and required of any external-launcher parent by the validation
+        # above). split_group filters subgroups by the parent's per-device
+        # backend name and requires an *exact* match, so the GroupCoordinators
+        # (world/TP/PP/DP) must request "nccl2" -- not the platform's plain
+        # dist_backend (e.g. "nccl"), which would raise a "Backend mismatch"
+        # error. Only the split-group path is affected; the legacy new_group
+        # path below keeps using the caller-provided backend unchanged.
+        backend = "nccl2"
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
