@@ -882,6 +882,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``torch.distributed.split_group(backend=...)``
     # and ``init_distributed_environment`` initializes the default PG with
     # mixed ``cpu:gloo,cuda:nccl`` backend + eager ``device_id`` binding.
+    # The pipeline-parallel device group is the one exception: it is built
+    # with ``new_group(backend="nccl-lazy", use_local_synchronization=True)``
+    # for per-peer lazy P2P comms. Set to 0 for the legacy ``new_group`` path
+    # over a lazily-initialized stock ``nccl`` world.
     "VLLM_DISTRIBUTED_USE_SPLIT_GROUP": lambda: bool(
         int(os.getenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "1"))
     ),
