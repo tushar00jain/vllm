@@ -312,6 +312,28 @@ def _platform_device_type() -> str:
         return "cpu"
 
 
+_PP_DEVICE_BACKEND = "nccl-lazy"
+
+
+def _pp_device_backend(
+    group_name: str, torch_distributed_backend: str | Backend
+) -> str | None:
+    backend = str(torch_distributed_backend)
+    if (
+        group_name != "pp"
+        or _platform_device_type() != "cuda"
+        or not backend.startswith("nccl")
+    ):
+        return None
+    resolved_backend = backend
+    if backend == "nccl":
+        default_pg = torch.distributed.distributed_c10d._get_default_group()
+        resolved_backend = default_pg._get_backend(torch.device("cuda")).name()
+    if resolved_backend in {"nccl2", _PP_DEVICE_BACKEND}:
+        return _PP_DEVICE_BACKEND
+    return backend
+
+
 def _device_backend_str(torch_distributed_backend: str | Backend) -> str:
     """Normalize ``torch_distributed_backend`` to the ``"<device>:<backend>"``
     format required by ``split_group``'s ``backend`` argument.
@@ -475,10 +497,13 @@ class GroupCoordinator:
 
         self_device_group = None
         self_cpu_group = None
+        pp_device_backend = _pp_device_backend(
+            group_name, torch_distributed_backend
+        )
 
         # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the new ``split_group``
         # codepath. Default (False) preserves the legacy ``new_group`` path.
-        if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+        if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP and pp_device_backend is None:
             self_device_group, self_cpu_group = _create_subgroups_split_group(
                 group_ranks, group_name, torch_distributed_backend
             )
@@ -500,7 +525,7 @@ class GroupCoordinator:
             for ranks in group_ranks:
                 device_group = torch.distributed.new_group(
                     ranks,
-                    backend=torch_distributed_backend,
+                    backend=pp_device_backend or torch_distributed_backend,
                     timeout=device_timeout,
                 )
                 # a group with `gloo` backend, to allow direct coordination between
