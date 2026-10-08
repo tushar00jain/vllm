@@ -26,7 +26,7 @@ from torch.distributed.distributed_c10d import (
     _get_default_timeout,
     _unregister_process_group,
 )
-from torch.distributed.rendezvous import rendezvous
+from torch.distributed.rendezvous import _get_use_libuv_from_query_dict
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -632,8 +632,24 @@ def stateless_init_torch_distributed_process_group(
             multi_tenant=True,
         )
     else:
-        store, rank, world_size = next(
-            rendezvous(init_method, rank, world_size, timeout=timeout)
+        # Create the store directly instead of going through
+        # ``torch.distributed.rendezvous``: when an elastic launcher (e.g.
+        # ``torchrun``) is in play it exports ``TORCHELASTIC_USE_AGENT_STORE``,
+        # and ``rendezvous`` then returns a client-only ``TCPStore`` on *every*
+        # rank, assuming the launcher's agent already serves the store at
+        # ``host:port``. This group owns a private ``host:port`` the agent
+        # knows nothing about, so no rank would start the server and all of
+        # them would block until the store timeout expires.
+        store = create_tcp_store(
+            host,
+            port,
+            world_size=world_size,
+            is_master=rank == 0,
+            timeout=timeout,
+            multi_tenant=True,
+            # no URL query to override it, so this is the USE_LIBUV default
+            # ``rendezvous`` would have resolved from the environment.
+            use_libuv=_get_use_libuv_from_query_dict({}),
         )
     store.set_timeout(timeout)
 
