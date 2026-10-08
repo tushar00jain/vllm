@@ -7,6 +7,7 @@ These tests verify that:
 2. Multiple subgroups work correctly with split_group.
 3. Both GPU and CPU all-reduce work on split groups.
 4. Pipeline-parallel P2P stays on a per-peer ``new_group`` backend.
+5. A singleton world reuses the default device ProcessGroup.
 """
 
 import os
@@ -21,6 +22,7 @@ import vllm.envs as envs
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     _pp_device_backend,
+    get_world_group,
     init_distributed_environment,
 )
 from vllm.utils.system_utils import update_environment_variables
@@ -94,6 +96,22 @@ def _verify_cpu_group(coordinator: GroupCoordinator):
         f"CPU group all-reduce failed: expected {expected}, "
         f"got {tensor.flatten()[0].item()}"
     )
+
+
+@worker_fn_wrapper
+def singleton_group_worker():
+    coordinator = get_world_group()
+    assert coordinator.backend == "nccl"
+    assert coordinator.device_group is torch.distributed.group.WORLD
+    assert coordinator.device_group is not coordinator.cpu_group
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 1,
+    reason="Need at least 1 GPU to run the test.",
+)
+def test_singleton_group_reuses_world_process_group():
+    distributed_run(singleton_group_worker, 1)
 
 
 # ---------------------------------------------------------------------------
