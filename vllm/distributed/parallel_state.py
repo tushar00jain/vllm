@@ -503,7 +503,11 @@ class GroupCoordinator:
 
         # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the new ``split_group``
         # codepath. Default (False) preserves the legacy ``new_group`` path.
-        if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP and pp_device_backend is None:
+        if (
+            envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP
+            and pp_device_backend is None
+            and all(len(ranks) > 1 for ranks in group_ranks)
+        ):
             self_device_group, self_cpu_group = _create_subgroups_split_group(
                 group_ranks, group_name, torch_distributed_backend
             )
@@ -523,11 +527,14 @@ class GroupCoordinator:
             device_timeout = get_distributed_timeout_or_none()
 
             for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks,
-                    backend=pp_device_backend or torch_distributed_backend,
-                    timeout=device_timeout,
-                )
+                if len(ranks) == 1 and torch.distributed.get_world_size() == 1:
+                    device_group = torch.distributed.group.WORLD
+                else:
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend=pp_device_backend or torch_distributed_backend,
+                        timeout=device_timeout,
+                    )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
                 with suppress_stdout():
@@ -546,6 +553,7 @@ class GroupCoordinator:
 
         self.group_ranks = group_ranks
         self.torch_distributed_backend = torch_distributed_backend
+        self.backend = str(torch_distributed_backend)
 
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
@@ -1424,7 +1432,8 @@ class GroupCoordinator:
         if self.device_communicator is not None:
             self.device_communicator.destroy()
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
+            if self.device_group is not torch.distributed.group.WORLD:
+                torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
             torch.distributed.destroy_process_group(self.cpu_group)
@@ -2144,9 +2153,7 @@ def initialize_model_parallel(
     else:
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
-        backend = backend or torch.distributed.get_backend(
-            get_world_group().device_group
-        )
+        backend = backend or get_world_group().backend
 
     # the layout order is: ExternalDP x DP x PP x PCP x TP
     # ExternalDP is the data parallel group that is not part of the model,
